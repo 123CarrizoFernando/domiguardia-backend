@@ -7,61 +7,129 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Conexión a Neon PostgreSQL
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
-// Función para calcular distancia en KM
+// Auto-verificación de columnas al iniciar el servidor
+async function inicializarColumnas() {
+  try {
+    await pool.query(`
+      ALTER TABLE solicitudes_guardia 
+      ADD COLUMN IF NOT EXISTS medico_nombre VARCHAR(120),
+      ADD COLUMN IF NOT EXISTS medico_alias VARCHAR(100);
+    `);
+    console.log('✅ Columnas verificadas en Neon PostgreSQL');
+  } catch (err) {
+    console.error('Aviso al verificar columnas:', err.message);
+  }
+}
+inicializarColumnas();
+
+app.get('/', (req, res) => {
+  res.json({ status: 'OK', servicio: 'DomiGuardia Salta API activa' });
+});
+
 function calcularDistanciaKm(lat1, lon1, lat2, lon2) {
-  const R = 6371; 
+  const R = 6371;
   const dLat = ((lat2 - lat1) * Math.PI) / 180;
   const dLon = ((lon2 - lon1) * Math.PI) / 180;
-  const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) + Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return Number((R * c).toFixed(1));
 }
 
-// 1. OBTENER SOLICITUDES PENDIENTES
+// 1. OBTENER SOLICITUDES PARA EL MÉDICO (Pendientes + En curso de ese médico)
 app.get('/api/solicitudes', async (req, res) => {
   try {
     const latMedico = parseFloat(req.query.lat) || -24.7859;
     const lngMedico = parseFloat(req.query.lng) || -65.4117;
+    const medicoId = req.query.medico_id ? parseInt(req.query.medico_id) : null;
 
-    const result = await pool.query(`SELECT * FROM solicitudes_guardia WHERE estado = 'PENDIENTE' ORDER BY creado_en DESC`);
+    let query = `
+      SELECT * FROM solicitudes_guardia 
+      WHERE estado = 'PENDIENTE'
+    `;
+    const params = [];
+
+    if (medicoId) {
+      query += ` OR (medico_id = $1 AND estado IN ('ACEPTADA', 'EN_CAMINO', 'EN_DOMICILIO'))`;
+      params.push(medicoId);
+    }
+
+    query += ` ORDER BY creado_en DESC`;
+
+    const result = await pool.query(query, params);
 
     const solicitudes = result.rows.map((row) => ({
       ...row,
       distancia_km: calcularDistanciaKm(latMedico, lngMedico, row.latitud, row.longitud),
     }));
+
     res.json(solicitudes);
   } catch (error) {
+    console.error('Error al obtener solicitudes:', error);
     res.status(500).json({ error: 'Error del servidor' });
   }
 });
 
-// 2. CREAR NUEVA SOLICITUD (Ahora guarda el paciente_id)
+// 2. CREAR NUEVA SOLICITUD
 app.post('/api/solicitudes', async (req, res) => {
   try {
     const {
-      paciente_id, nombre_paciente, telefono_paciente, para_quien, domicilio, referencias_casa, barrio, horario, motivo, observaciones_sintomas, metodo_pago, precio, latitud, longitud
+      paciente_id,
+      nombre_paciente,
+      telefono_paciente,
+      para_quien,
+      domicilio,
+      referencias_casa,
+      barrio,
+      horario,
+      motivo,
+      observaciones_sintomas,
+      metodo_pago,
+      precio,
+      latitud,
+      longitud,
     } = req.body;
 
     const result = await pool.query(
       `INSERT INTO solicitudes_guardia 
-      (paciente_id, nombre_paciente, telefono_paciente, para_quien, domicilio, referencias_casa, barrio, horario, motivo, observaciones_sintomas, metodo_pago, precio, latitud, longitud)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+      (paciente_id, nombre_paciente, telefono_paciente, para_quien, domicilio, referencias_casa, barrio, horario, motivo, observaciones_sintomas, metodo_pago, precio, latitud, longitud, estado)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'PENDIENTE')
       RETURNING *`,
-      [paciente_id, nombre_paciente, telefono_paciente, para_quien, domicilio, referencias_casa, barrio, horario, motivo, observaciones_sintomas, metodo_pago, precio || 30000, latitud, longitud]
+      [
+        paciente_id ? parseInt(paciente_id) : null,
+        nombre_paciente,
+        telefono_paciente,
+        para_quien,
+        domicilio,
+        referencias_casa,
+        barrio,
+        horario,
+        motivo,
+        observaciones_sintomas,
+        metodo_pago,
+        precio || 30000,
+        latitud,
+        longitud,
+      ]
     );
+
     res.status(201).json(result.rows[0]);
   } catch (error) {
+    console.error('Error al crear solicitud:', error);
     res.status(500).json({ error: 'No se pudo guardar la solicitud' });
   }
 });
 
-// 3. CONSULTAR ESTADO DE UNA SOLICITUD ESPECÍFICA
+// 3. CONSULTAR UNA SOLICITUD ESPECÍFICA
 app.get('/api/solicitudes/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -73,43 +141,51 @@ app.get('/api/solicitudes/:id', async (req, res) => {
   }
 });
 
-// 4. ACTUALIZAR ESTADO (Ahora registra qué médico aceptó la visita)
+// 4. ACTUALIZAR ESTADO, MÉDICO, ALIAS Y DIAGNÓSTICO
 app.patch('/api/solicitudes/:id/estado', async (req, res) => {
   try {
     const { id } = req.params;
-    const { estado, diagnostico_medico, medico_id, medico_nombre } = req.body;
+    const { estado, diagnostico_medico, medico_id, medico_nombre, medico_alias } = req.body;
 
     const result = await pool.query(
       `UPDATE solicitudes_guardia 
        SET estado = $1, 
            diagnostico_medico = COALESCE($2, diagnostico_medico),
            medico_id = COALESCE($3, medico_id),
-           medico_nombre = COALESCE($4, medico_nombre)
-       WHERE id = $5 
+           medico_nombre = COALESCE($4, medico_nombre),
+           medico_alias = COALESCE($5, medico_alias)
+       WHERE id = $6 
        RETURNING *`,
-      [estado, diagnostico_medico, medico_id, medico_nombre, id]
+      [
+        estado,
+        diagnostico_medico || null,
+        medico_id ? parseInt(medico_id) : null,
+        medico_nombre || null,
+        medico_alias || null,
+        id,
+      ]
     );
     res.json(result.rows[0]);
   } catch (error) {
+    console.error('Error al actualizar estado:', error);
     res.status(500).json({ error: 'No se pudo actualizar la visita' });
   }
 });
 
-// 5. OBTENER HISTORIAL FILTRADO POR USUARIO (El cambio clave)
+// 5. HISTORIAL FILTRADO POR USUARIO
 app.get('/api/historial', async (req, res) => {
   try {
     const { usuario_id, rol } = req.query;
     let query = `SELECT * FROM solicitudes_guardia ORDER BY creado_en DESC LIMIT 50`;
     let params = [];
 
-    // Si pasamos el ID, filtramos para que cada uno vea solo lo suyo
     if (usuario_id && rol) {
       if (rol === 'MEDICO') {
         query = `SELECT * FROM solicitudes_guardia WHERE medico_id = $1 ORDER BY creado_en DESC`;
       } else {
         query = `SELECT * FROM solicitudes_guardia WHERE paciente_id = $1 ORDER BY creado_en DESC`;
       }
-      params = [usuario_id];
+      params = [parseInt(usuario_id)];
     }
 
     const result = await pool.query(query, params);
@@ -138,7 +214,10 @@ app.post('/api/registro', async (req, res) => {
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    const result = await pool.query('SELECT * FROM usuarios WHERE email = $1 AND password = $2', [email, password]);
+    const result = await pool.query(
+      'SELECT * FROM usuarios WHERE LOWER(email) = LOWER($1) AND password = $2',
+      [email, password]
+    );
     if (result.rows.length > 0) {
       res.json(result.rows[0]);
     } else {
